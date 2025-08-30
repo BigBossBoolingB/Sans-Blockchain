@@ -5,7 +5,7 @@ from src.transaction import Transaction
 class Ledger:
     """
     Manages the chain of blocks (the ledger) for the Sovereign Ledger Protocol.
-    It handles the creation of new blocks, storing transactions, and maintaining the chain's integrity.
+    It is primarily a data structure, with validation logic handled by the Node.
     """
     def __init__(self):
         self.chain: List[Block] = []
@@ -21,7 +21,12 @@ class Ledger:
         Creates the very first block in the chain, the "genesis block".
         This block has no transactions and a 'previous_hash' of "0".
         """
-        genesis_block = Block(transactions=[], previous_hash="0")
+        # A validator address is required, for genesis we can use a system address
+        genesis_block = Block(
+            transactions=[],
+            previous_hash="0",
+            validator_address="SYSTEM_GENESIS"
+        )
         self.chain.append(genesis_block)
 
     @property
@@ -34,48 +39,15 @@ class Ledger:
     def add_transaction(self, transaction: Transaction):
         """
         Adds a new transaction to the list of pending transactions.
-        These transactions will be included in the next block to be created.
         """
         self.pending_transactions.append(transaction)
 
-    def mine_pending_transactions(self) -> Block:
+    def add_block(self, block: Block):
         """
-        Mines a new block, processes all pending transactions, and adds it to the chain.
-        This method orchestrates the creation and validation of a new block.
+        Adds a block to the chain. Assumes the block has already been validated
+        by the Node according to consensus rules.
         """
-        new_block = Block(
-            transactions=self.pending_transactions,
-            previous_hash=self.last_block.hash
-        )
-
-        # This is the crucial step where the consensus mechanism comes into play.
-        self.validate_and_add_block(new_block)
-
-        self.pending_transactions = []  # Reset pending transactions
-        return new_block
-
-    def validate_and_add_block(self, block: Block):
-        """
-        Validates a new block and adds it to the chain.
-
-        --- FOUNDATION FOR PROOF OF ARCHITECTURE (PoA) ---
-        This method serves as the placeholder for the Sovereign Ledger Protocol's
-        Proof of Architecture (PoA) consensus mechanism.
-
-        In a future implementation, this function will contain logic to verify a block
-        not based on computational work (like Proof of Work), but on the validating
-        node's proven, useful contributions to the network's health and integrity.
-
-        For now, it performs a simple validation of the previous hash.
-        """
-        if block.previous_hash != self.last_block.hash:
-            raise ValueError("Block validation failed: Previous hash does not match.")
-
-        # In a full PoA implementation, more complex validation would occur here,
-        # e.g., checking the validator's credentials, contribution score, etc.
-
         self.chain.append(block)
-
 
     def is_chain_valid(self) -> bool:
         """

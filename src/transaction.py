@@ -30,3 +30,19 @@ class Transaction:
             'amount': self.amount,
             'timestamp': self.timestamp,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        """
+        Creates a Transaction object from a dictionary representation.
+        """
+        # We create a new transaction object and then manually set the timestamp
+        # because the __init__ method automatically sets it to the current time.
+        tx = cls(
+            sender=data['sender'],
+            recipient=data['recipient'],
+            amount=data['amount']
+        )
+        tx.timestamp = data['timestamp']
+        # Signature handling would go here in a real implementation
+        return tx

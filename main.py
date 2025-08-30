@@ -22,17 +22,16 @@ async def run_node_ui(node: Node, initial_peers: list):
     while True:
         print("\n--- Sovereign Ledger Protocol Node CLI ---")
         print("1. Create and Broadcast Transaction")
-        print("2. Mine and Broadcast Block")
-        print("3. Print Ledger")
-        print("4. List Peers")
-        print("5. Exit")
+        print("2. Propose a New Block")
+        print("3. View Next Validator")
+        print("4. Print Ledger")
+        print("5. List Peers")
+        print("6. Exit")
 
         try:
-            # Use asyncio.to_thread to run the blocking input() call in a separate thread
             choice = await asyncio.to_thread(input, "Choose an option: ")
         except (EOFError, KeyboardInterrupt):
-            # Handle Ctrl+D or Ctrl+C during input as an exit command
-            choice = '5'
+            choice = '6'
 
         if choice == '1':
             try:
@@ -47,22 +46,32 @@ async def run_node_ui(node: Node, initial_peers: list):
                 print(f"An error occurred: {e}")
 
         elif choice == '2':
-            await node.mine_and_broadcast_block()
+            new_block = await node.propose_and_broadcast_block()
+            if new_block:
+                print("Block proposal successful.")
+            else:
+                print("Block proposal failed (perhaps you are not the validator?).")
 
         elif choice == '3':
-            print("\n" + "="*15 + " Current Ledger " + "="*15)
-            for i, block in enumerate(node.ledger.chain):
-                print(f"Block {i} | Hash: {block.hash[:12]}... | Prev. Hash: {block.previous_hash[:12]}...")
-                for tx in block.transactions:
-                    print(f"  -> {tx}")
-            print("="*48)
+            validator = node.select_validator()
+            print(f"\n>>> Validator for block height {len(node.ledger.chain)} is: {validator}")
+            if validator == node.address:
+                print(">>> That's this node! You can propose the next block.")
 
         elif choice == '4':
+            print("\n" + "="*15 + " Current Ledger " + "="*15)
+            for i, block in enumerate(node.ledger.chain):
+                print(f"Block {i} | Validator: {block.validator_address} | Hash: {block.hash[:12]}...")
+                for tx in block.transactions:
+                    print(f"  -> {tx}")
+            print("="*60)
+
+        elif choice == '5':
             print("\n" + "="*15 + " Known Peers " + "="*15)
             print(node)
             print("="*41)
 
-        elif choice == '5':
+        elif choice == '6':
             print("Shutting down node...")
             break
         else:
@@ -78,14 +87,11 @@ async def main():
 
     node = Node(host=args.host, port=args.port)
 
-    # Create and manage tasks for the server and the UI
     server_task = asyncio.create_task(node.start_server())
     ui_task = asyncio.create_task(run_node_ui(node, args.peers))
 
-    # Wait for the UI task to complete (e.g., user chooses to exit)
     await ui_task
 
-    # Once the UI is done, gracefully cancel the server task
     server_task.cancel()
     try:
         await server_task

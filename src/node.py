@@ -1,9 +1,25 @@
 import asyncio
 import json
-from typing import Set
+from dataclasses import dataclass
+from typing import Dict
 
 from src.ledger import Ledger
 from src.transaction import Transaction
+from src.block import Block
+
+# A constant for the reward given to a validator for forging a block
+VALIDATOR_REWARD = 100.0
+
+@dataclass
+class Peer:
+    """Represents a connected peer in the network."""
+    writer: asyncio.StreamWriter
+
+    @property
+    def address(self) -> str:
+        """Returns the peer's address as a 'host:port' string."""
+        peername = self.writer.get_extra_info('peername')
+        return f"{peername[0]}:{peername[1]}" if peername else "unknown"
 
 class Node:
     """
@@ -15,13 +31,39 @@ class Node:
         self.host = host
         self.port = port
         self.ledger = Ledger()
-        # The peers are stored as writer objects from asyncio streams
-        self.peers: Set[asyncio.StreamWriter] = set()
+        # Peers are stored by their 'host:port' address string
+        self.peers: Dict[str, Peer] = {}
+
+    @property
+    def address(self) -> str:
+        """Returns the node's own address as a 'host:port' string."""
+        return f"{self.host}:{self.port}"
 
     def __repr__(self) -> str:
-        # Get peer addresses for a more informative representation
-        peer_addresses = [f"{writer.get_extra_info('peername')[0]}:{writer.get_extra_info('peername')[1]}" for writer in self.peers]
-        return f"Node(host='{self.host}', port={self.port}, peers={peer_addresses})"
+        return f"Node(address='{self.address}', peers={list(self.peers.keys())})"
+
+    def select_validator(self) -> str:
+        """
+        Selects the validator for the next block using a deterministic round-robin algorithm.
+
+        This is the hook for the Proof of Architecture consensus. In a more advanced
+        implementation, this method would weigh nodes based on their PoA score rather
+        than using a simple round-robin.
+        """
+        # Get a sorted list of all known participants (self + peers) to ensure determinism.
+        participant_addresses = sorted(list(self.peers.keys()) + [self.address])
+
+        if not participant_addresses:
+            # This should not happen in a running network, but as a safeguard:
+            return self.address
+
+        # The round is determined by the current length of the chain.
+        chain_length = len(self.ledger.chain)
+
+        # The validator is chosen using a deterministic round-robin algorithm.
+        validator_index = chain_length % len(participant_addresses)
+
+        return participant_addresses[validator_index]
 
     async def start_server(self):
         """
@@ -30,46 +72,52 @@ class Node:
         server = await asyncio.start_server(
             self.handle_connection, self.host, self.port
         )
-        addr = server.sockets[0].getsockname()
-        print(f"Node server listening on {addr}")
+        print(f"Node server listening on {self.address}")
         async with server:
             await server.serve_forever()
 
-    async def broadcast(self, message: dict, exclude_peer: asyncio.StreamWriter = None):
+    async def broadcast(self, message: dict, exclude_peer_address: str = None):
         """
-        Broadcasts a message to all connected peers, except the one specified.
+        Broadcasts a message to all connected peers, except the one specified by address.
         """
         message_json = json.dumps(message) + '\n'
         message_bytes = message_json.encode()
 
         disconnected_peers = []
-        for peer_writer in self.peers:
-            if peer_writer == exclude_peer:
+        for peer_address, peer in self.peers.items():
+            if peer_address == exclude_peer_address:
                 continue
 
-            if peer_writer.is_closing():
-                disconnected_peers.append(peer_writer)
+            if peer.writer.is_closing():
+                disconnected_peers.append(peer_address)
                 continue
 
             try:
-                peer_writer.write(message_bytes)
-                await peer_writer.drain()
+                peer.writer.write(message_bytes)
+                await peer.writer.drain()
             except ConnectionError as e:
-                print(f"Failed to send message to a peer: {e}. Marking for removal.")
-                disconnected_peers.append(peer_writer)
+                print(f"Failed to send message to peer {peer_address}: {e}. Marking for removal.")
+                disconnected_peers.append(peer_address)
 
-        # Clean up peers that were found to be disconnected
-        for peer in disconnected_peers:
-            if peer in self.peers:
-                self.peers.remove(peer)
+        for address in disconnected_peers:
+            if address in self.peers:
+                del self.peers[address]
 
     async def handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """
         Handles a connection from a peer, processing incoming messages and driving ledger operations.
         """
-        addr = writer.get_extra_info('peername')
-        print(f"Managing connection with {addr}")
-        self.peers.add(writer)
+        peer = Peer(writer=writer)
+        peer_address = peer.address
+
+        if not peer_address or peer_address == "unknown":
+            print("Could not determine peer address. Closing connection.")
+            writer.close()
+            await writer.wait_closed()
+            return
+
+        print(f"Managing connection with {peer_address}")
+        self.peers[peer_address] = peer
 
         try:
             while True:
@@ -87,37 +135,32 @@ class Node:
 
                     if message_type == 'NEW_TRANSACTION':
                         tx_data = message['payload']
-                        # Basic validation to prevent malformed data
                         if all(k in tx_data for k in ['sender', 'recipient', 'amount']):
                             transaction = Transaction(sender=tx_data['sender'], recipient=tx_data['recipient'], amount=float(tx_data['amount']))
-                            # TODO: Add more robust validation (e.g., check if tx already exists)
                             self.ledger.add_transaction(transaction)
                             print(f"Added transaction from network: {transaction.to_dict()}")
-                            await self.broadcast(message, exclude_peer=writer)
+                            await self.broadcast(message, exclude_peer_address=peer_address)
                         else:
                             print("Received invalid transaction payload.")
 
                     elif message_type == 'NEW_BLOCK':
-                        # In a real system, we'd deserialize, validate the block, and check PoA.
-                        print("Received new block announcement from network.")
-                        await self.broadcast(message, exclude_peer=writer)
+                        await self.handle_new_block(message['payload'], peer_address)
 
                     else:
                         print(f"Received unhandled message type: {message_type}")
-                        # Still gossip unknown message types for future compatibility
-                        await self.broadcast(message, exclude_peer=writer)
+                        await self.broadcast(message, exclude_peer_address=peer_address)
 
                 except json.JSONDecodeError:
-                    print(f"Received invalid JSON from {addr}: {message_str}")
+                    print(f"Received invalid JSON from {peer_address}: {message_str}")
                 except Exception as e:
-                    print(f"Error processing message from {addr}: {e}")
+                    print(f"Error processing message from {peer_address}: {e}")
 
         except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError) as e:
-            print(f"Connection with {addr} lost: {e}")
+            print(f"Connection with {peer_address} lost: {e}")
         finally:
-            print(f"Closing connection with {addr}")
-            if writer in self.peers:
-                self.peers.remove(writer)
+            print(f"Closing connection with {peer_address}")
+            if peer_address in self.peers:
+                del self.peers[peer_address]
             if not writer.is_closing():
                 writer.close()
                 await writer.wait_closed()
@@ -136,27 +179,95 @@ class Node:
         print(f"Created and broadcasting new transaction: {transaction.to_dict()}")
         await self.broadcast(message)
 
-    async def mine_and_broadcast_block(self):
+    async def propose_and_broadcast_block(self):
         """
-        Mines a new block from pending transactions and broadcasts the announcement.
+        Checks if this node is the current validator. If so, it forges a new block,
+        including a reward transaction, and broadcasts it to the network.
         """
-        if not self.ledger.pending_transactions:
-            print("No pending transactions to mine.")
+        validator_address = self.select_validator()
+
+        if validator_address != self.address:
+            print(f"I am not the validator for the next block. Validator is {validator_address}.")
             return None
 
-        new_block = self.ledger.mine_pending_transactions()
-        print(f"Mined new block locally: {new_block.hash}")
+        print(f"I am the validator. Proposing a new block...")
 
+        # Create the reward transaction for the validator (this node)
+        reward_transaction = Transaction(
+            sender="NETWORK_REWARD",
+            recipient=self.address,
+            amount=VALIDATOR_REWARD
+        )
+
+        # The transactions for the new block include pending ones and the reward
+        transactions_for_block = self.ledger.pending_transactions + [reward_transaction]
+
+        # Create the new block
+        new_block = Block(
+            transactions=transactions_for_block,
+            previous_hash=self.ledger.last_block.hash,
+            validator_address=self.address
+        )
+
+        # Add the new block to our own ledger
+        self.ledger.add_block(new_block)
+        print(f"Successfully forged and added new block: {new_block.hash}")
+
+        # If the block was added successfully, clear the pending transactions
+        self.ledger.pending_transactions = []
+
+        # Broadcast the new block to the network
+        block_data = new_block.to_dict()
+        block_data['hash'] = new_block.hash
         message = {
             'type': 'NEW_BLOCK',
-            'payload': {
-                'hash': new_block.hash,
-                'timestamp': new_block.timestamp,
-                'transaction_count': len(new_block.transactions)
-            }
+            'payload': block_data
         }
         await self.broadcast(message)
         return new_block
+
+    async def handle_new_block(self, block_data: dict, source_peer_address: str):
+        """
+        Handles a new block received from the network, performing full validation
+        before adding it to the ledger and re-broadcasting.
+        """
+        print(f"Received new block for validation: {block_data.get('hash')[:12]}...")
+
+        try:
+            new_block = Block.from_dict(block_data)
+
+            # 1. Authenticity Check: Does the hash match the content?
+            if new_block.hash != new_block.compute_hash():
+                print(f"Validation failed: Block hash is incorrect.")
+                return
+
+            # 2. Integrity Check: Does it connect to our chain?
+            if new_block.previous_hash != self.ledger.last_block.hash:
+                print(f"Validation failed: Previous hash does not match our chain.")
+                return
+
+            # 3. Authority Check: Was it created by the correct validator?
+            expected_validator = self.select_validator()
+            if new_block.validator_address != expected_validator:
+                print(f"Validation failed: Incorrect validator. Expected {expected_validator}, got {new_block.validator_address}.")
+                return
+
+            # All checks passed. Add the block to our ledger.
+            self.ledger.add_block(new_block)
+            print(f"Successfully validated and added new block: {new_block.hash}")
+
+            # Clear our pending transactions that are now confirmed in this block
+            self.ledger.pending_transactions = [
+                tx for tx in self.ledger.pending_transactions
+                if tx not in new_block.transactions
+            ]
+
+            # Gossip the valid block to our peers.
+            message = {'type': 'NEW_BLOCK', 'payload': block_data}
+            await self.broadcast(message, exclude_peer_address=source_peer_address)
+
+        except Exception as e:
+            print(f"Error validating new block: {e}")
 
     async def connect_to_peer(self, host: str, port: int):
         """
