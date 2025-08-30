@@ -1,74 +1,101 @@
-from src.ledger import Ledger
-from src.transaction import Transaction
+import asyncio
+import argparse
+from src.node import Node
 
-def run_demonstration():
-    """
-    Runs a demonstration of the Sovereign Ledger Protocol, showcasing its core functionalities.
-    """
-    # --- 1. Initialize the Ledger ---
-    print("Initializing the Sovereign Ledger Protocol...")
-    slp_ledger = Ledger()
-    print(f"Ledger initialized. Genesis Block created: {slp_ledger.chain[0]}")
-    print("-" * 30)
+async def run_node_ui(node: Node, initial_peers: list):
+    """A simple command-line interface to interact with the node."""
+    # Give the server a moment to start up
+    await asyncio.sleep(1)
 
-    # --- 2. Add Transactions ---
-    print("Adding transactions to the pending pool...")
-    tx1 = Transaction(sender="address-alice", recipient="address-bob", amount=10.5)
-    slp_ledger.add_transaction(tx1)
-    print(f"Added transaction: {tx1}")
+    # Connect to initial seed peers provided via command line
+    if initial_peers:
+        print(f"Connecting to seed peers: {initial_peers}...")
+        for peer in initial_peers:
+            try:
+                host, port_str = peer.split(':')
+                port = int(port_str)
+                await node.connect_to_peer(host, port)
+            except ValueError:
+                print(f"Invalid peer format: {peer}. Should be host:port.")
+        print("-" * 30)
 
-    tx2 = Transaction(sender="address-bob", recipient="address-charlie", amount=5.0)
-    slp_ledger.add_transaction(tx2)
-    print(f"Added transaction: {tx2}")
+    while True:
+        print("\n--- Sovereign Ledger Protocol Node CLI ---")
+        print("1. Create and Broadcast Transaction")
+        print("2. Mine and Broadcast Block")
+        print("3. Print Ledger")
+        print("4. List Peers")
+        print("5. Exit")
 
-    print(f"\nCurrent Ledger state: {slp_ledger}")
-    print("-" * 30)
+        try:
+            # Use asyncio.to_thread to run the blocking input() call in a separate thread
+            choice = await asyncio.to_thread(input, "Choose an option: ")
+        except (EOFError, KeyboardInterrupt):
+            # Handle Ctrl+D or Ctrl+C during input as an exit command
+            choice = '5'
 
-    # --- 3. Mine a New Block ---
-    print("Mining a new block to process pending transactions...")
-    mined_block = slp_ledger.mine_pending_transactions()
-    print(f"New block mined successfully: {mined_block}")
-    print(f"\nUpdated Ledger state: {slp_ledger}")
-    print("Chain length:", len(slp_ledger.chain))
-    print("-" * 30)
+        if choice == '1':
+            try:
+                sender = await asyncio.to_thread(input, "  Sender address: ")
+                recipient = await asyncio.to_thread(input, "  Recipient address: ")
+                amount_str = await asyncio.to_thread(input, "  Amount: ")
+                amount = float(amount_str)
+                await node.create_and_broadcast_transaction(sender, recipient, amount)
+            except ValueError:
+                print("Error: Invalid amount. Please enter a number.")
+            except Exception as e:
+                print(f"An error occurred: {e}")
 
-    # --- 4. Verify the Chain's Integrity ---
-    print("Verifying the integrity of the ledger...")
-    is_valid = slp_ledger.is_chain_valid()
-    print(f"Is the ledger valid? {is_valid}")
-    if is_valid:
-        print("Ledger integrity confirmed.")
-    else:
-        print("Ledger integrity compromised!")
-    print("-" * 30)
+        elif choice == '2':
+            await node.mine_and_broadcast_block()
 
-    # --- 5. Demonstrate Tamper-Proofing ---
-    print("Attempting to tamper with the ledger...")
-    try:
-        # The tampered block is the second in the chain (index 1)
-        tampered_block = slp_ledger.chain[1]
-        print(f"Original first transaction in block 1: {tampered_block.transactions[0]}")
+        elif choice == '3':
+            print("\n" + "="*15 + " Current Ledger " + "="*15)
+            for i, block in enumerate(node.ledger.chain):
+                print(f"Block {i} | Hash: {block.hash[:12]}... | Prev. Hash: {block.previous_hash[:12]}...")
+                for tx in block.transactions:
+                    print(f"  -> {tx}")
+            print("="*48)
 
-        # A malicious actor tries to change the transaction amount after mining
-        tampered_block.transactions[0].amount = 1000.0
-        print(f"Tampered first transaction in block 1: {tampered_block.transactions[0]}")
+        elif choice == '4':
+            print("\n" + "="*15 + " Known Peers " + "="*15)
+            print(node)
+            print("="*41)
 
-        print(f"Original block hash: {tampered_block.hash}")
-        print(f"Hash after tampering: {tampered_block.compute_hash()}")
-
-        print("\nRe-verifying the ledger after tampering...")
-        is_valid_after_tamper = slp_ledger.is_chain_valid()
-        print(f"Is the ledger still valid? {is_valid_after_tamper}")
-        if not is_valid_after_tamper:
-            print("Success! Tampering was detected, as expected.")
+        elif choice == '5':
+            print("Shutting down node...")
+            break
         else:
-            print("Failure! Tampering was not detected.")
+            print("Invalid choice. Please try again.")
 
-    except IndexError:
-        print("Could not perform tamper test: chain is not long enough.")
+async def main():
+    """Main function to set up and run the SLP node."""
+    parser = argparse.ArgumentParser(description="Run a node for the Sovereign Ledger Protocol.")
+    parser.add_argument('--host', type=str, default='127.0.0.1', help='Host to listen on.')
+    parser.add_argument('--port', type=int, required=True, help='Port to listen on.')
+    parser.add_argument('--peers', nargs='*', default=[], help='List of seed peers to connect to (e.g., 127.0.0.1:8889).')
+    args = parser.parse_args()
 
-    print("-" * 30)
-    print("Demonstration complete.")
+    node = Node(host=args.host, port=args.port)
+
+    # Create and manage tasks for the server and the UI
+    server_task = asyncio.create_task(node.start_server())
+    ui_task = asyncio.create_task(run_node_ui(node, args.peers))
+
+    # Wait for the UI task to complete (e.g., user chooses to exit)
+    await ui_task
+
+    # Once the UI is done, gracefully cancel the server task
+    server_task.cancel()
+    try:
+        await server_task
+    except asyncio.CancelledError:
+        print("Server task has been cancelled successfully.")
 
 if __name__ == "__main__":
-    run_demonstration()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nCaught KeyboardInterrupt, initiating shutdown.")
+    finally:
+        print("Node shutdown complete.")
