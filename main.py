@@ -25,13 +25,14 @@ async def run_node_ui(node: Node, initial_peers: list):
         print("2. Propose a New Block")
         print("3. View Next Validator")
         print("4. Print Ledger")
-        print("5. List Peers")
-        print("6. Exit")
+        print("5. View Trust Ledger")
+        print("6. List Peers")
+        print("7. Exit")
 
         try:
             choice = await asyncio.to_thread(input, "Choose an option: ")
         except (EOFError, KeyboardInterrupt):
-            choice = '6'
+            choice = '7'
 
         if choice == '1':
             try:
@@ -67,11 +68,19 @@ async def run_node_ui(node: Node, initial_peers: list):
             print("="*60)
 
         elif choice == '5':
+            print("\n" + "="*15 + " Trust Ledger " + "="*15)
+            # Sort the ledger by score for readability
+            sorted_ledger = sorted(node.trust_ledger.items(), key=lambda item: item[1], reverse=True)
+            for address, score in sorted_ledger:
+                print(f"  - {address}: {score:.2f}")
+            print("="*42)
+
+        elif choice == '6':
             print("\n" + "="*15 + " Known Peers " + "="*15)
             print(node)
             print("="*41)
 
-        elif choice == '6':
+        elif choice == '7':
             print("Shutting down node...")
             break
         else:

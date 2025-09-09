@@ -10,6 +10,12 @@ from src.block import Block
 # A constant for the reward given to a validator for forging a block
 VALIDATOR_REWARD = 100.0
 
+# --- Proof of Architecture Constants ---
+INITIAL_TRUST_SCORE = 10.0
+VALIDATION_REWARD_SCORE = 5.0
+UPTIME_REWARD_SCORE = 0.1
+UPTIME_REWARD_INTERVAL_SECONDS = 60
+
 @dataclass
 class Peer:
     """Represents a connected peer in the network."""
@@ -33,6 +39,10 @@ class Node:
         self.ledger = Ledger()
         # Peers are stored by their 'host:port' address string
         self.peers: Dict[str, Peer] = {}
+        # The trust ledger stores the PoA score for all known participants
+        self.trust_ledger: Dict[str, float] = {}
+        # Initialize its own trust score
+        self.trust_ledger[self.address] = INITIAL_TRUST_SCORE
 
     @property
     def address(self) -> str:
@@ -42,39 +52,80 @@ class Node:
     def __repr__(self) -> str:
         return f"Node(address='{self.address}', peers={list(self.peers.keys())})"
 
+    def update_trust_score(self, address: str, change: float):
+        """
+        Updates the trust score for a given address.
+        Initializes the score if the address is not yet in the ledger.
+        """
+        if address not in self.trust_ledger:
+            self.trust_ledger[address] = INITIAL_TRUST_SCORE
+
+        self.trust_ledger[address] += change
+        print(f"Updated trust score for {address}: {self.trust_ledger[address]:.2f} (Change: {change:+.2f})")
+
     def select_validator(self) -> str:
         """
-        Selects the validator for the next block using a deterministic round-robin algorithm.
-
-        This is the hook for the Proof of Architecture consensus. In a more advanced
-        implementation, this method would weigh nodes based on their PoA score rather
-        than using a simple round-robin.
+        Selects the validator for the next block based on the highest trust score.
+        Ties are broken deterministically by sorting the addresses.
+        This is the core of the Proof of Architecture consensus mechanism.
         """
-        # Get a sorted list of all known participants (self + peers) to ensure determinism.
-        participant_addresses = sorted(list(self.peers.keys()) + [self.address])
-
-        if not participant_addresses:
-            # This should not happen in a running network, but as a safeguard:
+        if not self.trust_ledger:
+            # Should not happen as the node itself is always in the ledger, but acts as a safeguard.
+            print("Warning: Trust ledger is empty. Defaulting to self as validator.")
             return self.address
 
-        # The round is determined by the current length of the chain.
-        chain_length = len(self.ledger.chain)
+        # Find the maximum trust score in the ledger
+        max_score = max(self.trust_ledger.values())
 
-        # The validator is chosen using a deterministic round-robin algorithm.
-        validator_index = chain_length % len(participant_addresses)
+        # Find all participants who have this maximum score
+        top_validators = [
+            address for address, score in self.trust_ledger.items()
+            if score == max_score
+        ]
 
-        return participant_addresses[validator_index]
+        # Deterministically break any ties by sorting the addresses alphabetically
+        top_validators.sort()
+
+        # The winner is the first one in the sorted list
+        return top_validators[0]
 
     async def start_server(self):
         """
-        Starts the node's server to listen for incoming connections from peers.
+        Starts the node's server and the periodic uptime reward task.
         """
         server = await asyncio.start_server(
             self.handle_connection, self.host, self.port
         )
         print(f"Node server listening on {self.address}")
-        async with server:
+
+        # Start the uptime reward task in the background
+        uptime_task = asyncio.create_task(self.periodic_uptime_reward())
+
+        try:
             await server.serve_forever()
+        finally:
+            # When serve_forever is cancelled, cancel the uptime task too
+            print("Server shutting down, stopping uptime rewards...")
+            uptime_task.cancel()
+            try:
+                await uptime_task
+            except asyncio.CancelledError:
+                pass # Task cancellation is expected
+
+    async def periodic_uptime_reward(self):
+        """Periodically rewards this node and its active peers for being online."""
+        while True:
+            await asyncio.sleep(UPTIME_REWARD_INTERVAL_SECONDS)
+
+            print("\n--- Applying Uptime Rewards ---")
+            # Reward self
+            self.update_trust_score(self.address, UPTIME_REWARD_SCORE)
+
+            # Reward connected peers
+            for peer_address in self.peers.keys():
+                self.update_trust_score(peer_address, UPTIME_REWARD_SCORE)
+            print("-----------------------------\n")
+
 
     async def broadcast(self, message: dict, exclude_peer_address: str = None):
         """
@@ -118,6 +169,9 @@ class Node:
 
         print(f"Managing connection with {peer_address}")
         self.peers[peer_address] = peer
+        if peer_address not in self.trust_ledger:
+            self.trust_ledger[peer_address] = INITIAL_TRUST_SCORE
+            print(f"Peer {peer_address} added to trust ledger with score {INITIAL_TRUST_SCORE}.")
 
         try:
             while True:
@@ -161,6 +215,11 @@ class Node:
             print(f"Closing connection with {peer_address}")
             if peer_address in self.peers:
                 del self.peers[peer_address]
+            # When a peer disconnects, we remove them from the trust ledger.
+            # A more advanced system might keep the score for a while.
+            if peer_address in self.trust_ledger:
+                del self.trust_ledger[peer_address]
+                print(f"Peer {peer_address} removed from trust ledger.")
             if not writer.is_closing():
                 writer.close()
                 await writer.wait_closed()
@@ -255,6 +314,10 @@ class Node:
             # All checks passed. Add the block to our ledger.
             self.ledger.add_block(new_block)
             print(f"Successfully validated and added new block: {new_block.hash}")
+
+            # --- REWARD THE VALIDATOR ---
+            # This is the core feedback loop of Proof of Architecture.
+            self.update_trust_score(new_block.validator_address, VALIDATION_REWARD_SCORE)
 
             # Clear our pending transactions that are now confirmed in this block
             self.ledger.pending_transactions = [
